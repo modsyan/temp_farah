@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from typing import List, Dict, Any
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_community.document_loaders import WebBaseLoader
@@ -14,6 +14,8 @@ import logging
 import os
 import time
 import openai
+from sse_starlette.sse import EventSourceResponse
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -108,6 +110,33 @@ async def chat(request: ChatRequest):
         return {"answer": response["answer"]}  # Ensure this returns the expected response structure
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat/stream")
+async def chat_stream(request: Request):
+    global chat_history, vector_store
+    if vector_store is None:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+
+    message = request.query_params.get("message")
+    if not message:
+        raise HTTPException(status_code=400, detail="Missing 'message' query parameter")
+
+    user_message = HumanMessage(content=message)
+    retriever_chain = get_context_retriever_chain(vector_store)
+    conversation_rag_chain = get_conversational_rag_chain(retriever_chain)
+
+    async def event_generator():
+        if await request.is_disconnected():
+            return
+        response = conversation_rag_chain.invoke(
+            {"chat_history": chat_history, "input": user_message}
+        )
+        chat_history.append(user_message)
+        ai_message = AIMessage(content=response["answer"])
+        chat_history.append(ai_message)
+        yield {"data": json.dumps({"role": "bot", "content": ai_message.content})}
+
+    return EventSourceResponse(event_generator())
 
 def get_context_retriever_chain(vector_store):
     logger.info("Creating context retriever chain")

@@ -1,6 +1,5 @@
 "use client";
 import React, { useState, useEffect } from "react";
-import axios from "axios";
 import * as z from "zod";
 import { Heading } from "@/components/heading";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -60,20 +59,27 @@ const ConversationPage = () => {
   const onChatSubmit = async (data: any) => {
     setIsLoading(true);
     try {
-      const response = await axios.post("/api/chat", { message: data.message });
-      console.log("API Response: ", response.data); // Log the response to see its structure
+      const eventSource = new EventSource(`/api/chat/stream?message=${encodeURIComponent(data.message)}`);
 
-      // Ensure this matches the actual response structure
-      setMessages([
-        ...messages,
-        { role: "user", content: data.message },
-        { role: "bot", content: response.data.answer }, // Ensure this matches the actual response structure
-      ]);
+      eventSource.onmessage = (event) => {
+        const parsedData = JSON.parse(event.data);
+        setMessages((prevMessages) => [
+          ...prevMessages,
+          { role: "user", content: data.message },
+          { role: "bot", content: parsedData.content },
+        ]);
+      };
+
+      eventSource.onerror = (error) => {
+        console.error("Error in SSE: ", error);
+        eventSource.close();
+      };
+
+      chatForm.reset();
     } catch (error) {
       console.error("Error in chat: ", error);
     }
     setIsLoading(false);
-    chatForm.reset();
   };
 
   return (
