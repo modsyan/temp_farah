@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 import logging
 import os
 import time
-import openai
+from openai import OpenAI
 from sse_starlette.sse import EventSourceResponse
 import json
 
@@ -31,6 +31,8 @@ if api_key:
 else:
     logger.error("OpenAI API key not found")
 
+client = OpenAI(api_key=api_key)
+
 app = FastAPI()
 
 # Global variables for chat history and vector store
@@ -42,6 +44,12 @@ class UrlModel(BaseModel):
 
 @app.post("/api/scrape")
 async def get_vectorstore_from_url(item: UrlModel):
+    """
+        Request Example:
+        {
+            "url": "https://www.example.com"
+        }
+    """
     url = item.url
     global vector_store
     logger.info(f"Received request to scrape URL: {url}")
@@ -62,11 +70,11 @@ async def get_vectorstore_from_url(item: UrlModel):
                 vector_store = Chroma.from_documents(document_chunks, OpenAIEmbeddings(openai_api_key=api_key))
                 logger.info("Vector store initialized")
                 return {"message": "Vector store initialized"}
-            except openai.error.RateLimitError as e:
+            except OpenAI.RateLimitError as e:
                 logger.warning(f"Rate limit exceeded. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
                 time.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
-            except openai.error.OpenAIError as e:
+            except OpenAI.OpenAIError as e:
                 if e.http_status == 429:
                     logger.error(f"Quota exceeded: {e}")
                     raise HTTPException(status_code=429, detail="Quota exceeded. Please check your OpenAI plan and usage.")
@@ -80,6 +88,29 @@ async def get_vectorstore_from_url(item: UrlModel):
 class ChatRequest(BaseModel):
     message: str
 
+def call_openai_model(model: str, message: str) -> str:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": message}
+        ]
+    )
+    return response.choices[0].message.content
+
+def evaluate_response_accuracy(response: str, context: str) -> int:
+    # Simple heuristic to evaluate response accuracy based on context
+    score = 0
+    for word in context.split():
+        if word.lower() in response.lower():
+            score += 1
+    return score
+
+def get_best_response(responses: Dict[str, str], context: str) -> str:
+    # Evaluate the accuracy of each response based on the context and select the best one
+    best_model = max(responses, key=lambda model: evaluate_response_accuracy(responses[model], context))
+    return responses[best_model]
+
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
     global chat_history, vector_store
@@ -90,24 +121,32 @@ async def chat(request: ChatRequest):
         user_message = HumanMessage(content=request.message)
 
         retriever_chain = get_context_retriever_chain(vector_store)
-        conversation_rag_chain = get_conversational_rag_chain(retriever_chain)
+        context = retriever_chain.invoke({"input": request.message, "chat_history": chat_history})
+        logger.info(f"Context: {context}")
+
+        # Assuming context is a list of documents
+        context_text = " ".join(doc.page_content for doc in context)
 
         logger.info(f"User message: {user_message.content}")
         logger.info(f"Chat history: {chat_history}")
-        response = conversation_rag_chain.invoke(
-            {"chat_history": chat_history, "input": user_message}
-        )
+
+        responses = {}
+        models = ["gpt-3.5-turbo", "gpt-4"]
+        for model in models:
+            response = call_openai_model(model, request.message)
+            responses[model] = response
+            logger.info(f"Response from {model}: {response}")
+
+        best_response = get_best_response(responses, context_text)
+        logger.info(f"Best response: {best_response}")
 
         chat_history.append(user_message)
-
-        ai_message = AIMessage(content=response["answer"])
+        ai_message = AIMessage(content=best_response)
         chat_history.append(ai_message)
 
-        logger.info(f"AI response: {ai_message.content}")
-
-        return {"answer": response["answer"]}
+        return {"answer": best_response}
     except Exception as e:
-        logger.error(f"Error in chat endpoint: {e}")
+        logger.error(f"Error in chat endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/chat/stream")
@@ -122,21 +161,33 @@ async def chat_stream(request: Request):
 
     user_message = HumanMessage(content=message)
     retriever_chain = get_context_retriever_chain(vector_store)
-    conversation_rag_chain = get_conversational_rag_chain(retriever_chain)
+    context = retriever_chain.invoke({"input": message, "chat_history": chat_history})
+    logger.info(f"Context: {context}")
+
+    # Assuming context is a list of documents
+    context_text = " ".join(doc.page_content for doc in context)
 
     async def event_generator():
         try:
             if await request.is_disconnected():
                 return
-            response = conversation_rag_chain.invoke(
-                {"chat_history": chat_history, "input": user_message}
-            )
+
+            responses = {}
+            models = ["gpt-3.5-turbo", "gpt-4"]
+            for model in models:
+                response = call_openai_model(model, message)
+                responses[model] = response
+                logger.info(f"Response from {model}: {response}")
+
+            best_response = get_best_response(responses, context_text)
+            logger.info(f"Best response: {best_response}")
+
             chat_history.append(user_message)
-            ai_message = AIMessage(content=response["answer"])
+            ai_message = AIMessage(content=best_response)
             chat_history.append(ai_message)
-            yield {"data": json.dumps({"role": "bot", "content": ai_message.content})}
+            yield {"data": json.dumps({"role": "bot", "content": best_response})}
         except Exception as e:
-            logger.error(f"Error in chat_stream: {e}")
+            logger.error(f"Error in chat_stream: {e}", exc_info=True)
             yield {"data": json.dumps({"error": str(e)})}
 
     return EventSourceResponse(event_generator())
