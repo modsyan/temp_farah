@@ -47,9 +47,6 @@ async def get_vectorstore_from_url(item: UrlModel):
     logger.info(f"Received request to scrape URL: {url}")
 
     try:
-        # Log the received URL for debugging
-        logger.info(f"Received URL: {url}")
-
         loader = WebBaseLoader(url)
         document = loader.load()
         text_splitter = RecursiveCharacterTextSplitter()
@@ -58,7 +55,6 @@ async def get_vectorstore_from_url(item: UrlModel):
         if not api_key:
             raise ValueError("OpenAI API key not found")
 
-        # Retry logic with exponential backoff
         max_retries = 5
         retry_delay = 2  # initial delay in seconds
         for attempt in range(max_retries):
@@ -107,8 +103,11 @@ async def chat(request: ChatRequest):
         ai_message = AIMessage(content=response["answer"])
         chat_history.append(ai_message)
 
-        return {"answer": response["answer"]}  # Ensure this returns the expected response structure
+        logger.info(f"AI response: {ai_message.content}")
+
+        return {"answer": response["answer"]}
     except Exception as e:
+        logger.error(f"Error in chat endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/chat/stream")
@@ -126,15 +125,19 @@ async def chat_stream(request: Request):
     conversation_rag_chain = get_conversational_rag_chain(retriever_chain)
 
     async def event_generator():
-        if await request.is_disconnected():
-            return
-        response = conversation_rag_chain.invoke(
-            {"chat_history": chat_history, "input": user_message}
-        )
-        chat_history.append(user_message)
-        ai_message = AIMessage(content=response["answer"])
-        chat_history.append(ai_message)
-        yield {"data": json.dumps({"role": "bot", "content": ai_message.content})}
+        try:
+            if await request.is_disconnected():
+                return
+            response = conversation_rag_chain.invoke(
+                {"chat_history": chat_history, "input": user_message}
+            )
+            chat_history.append(user_message)
+            ai_message = AIMessage(content=response["answer"])
+            chat_history.append(ai_message)
+            yield {"data": json.dumps({"role": "bot", "content": ai_message.content})}
+        except Exception as e:
+            logger.error(f"Error in chat_stream: {e}")
+            yield {"data": json.dumps({"error": str(e)})}
 
     return EventSourceResponse(event_generator())
 

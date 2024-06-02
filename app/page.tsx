@@ -1,5 +1,6 @@
 "use client";
 import React, { useState, useEffect } from "react";
+import axios from "axios";
 import * as z from "zod";
 import { Heading } from "@/components/heading";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -59,27 +60,50 @@ const ConversationPage = () => {
   const onChatSubmit = async (data: any) => {
     setIsLoading(true);
     try {
+      const response = await axios.post("/api/chat", { message: data.message });
+      console.log("API Response: ", response.data); // Log the response to see its structure
+
+      setMessages((prevMessages) => [
+        ...prevMessages,
+        { role: "user", content: data.message },
+      ]);
+
+      // Open SSE connection
       const eventSource = new EventSource(`/api/chat/stream?message=${encodeURIComponent(data.message)}`);
 
       eventSource.onmessage = (event) => {
         const parsedData = JSON.parse(event.data);
-        setMessages((prevMessages) => [
-          ...prevMessages,
-          { role: "user", content: data.message },
-          { role: "bot", content: parsedData.content },
-        ]);
+        console.log("SSE Message:", parsedData); // Log SSE messages for debugging
+        if (parsedData.role === "bot" && parsedData.content) {
+          setMessages((prevMessages) => [
+            ...prevMessages,
+            { role: "bot", content: parsedData.content },
+          ]);
+        }
       };
 
       eventSource.onerror = (error) => {
-        console.error("Error in SSE: ", error);
+        console.error("SSE error: ", error);
         eventSource.close();
       };
 
-      chatForm.reset();
+      eventSource.onopen = () => {
+        console.log("SSE connection opened");
+      };
+
+      eventSource.onclose = () => {
+        console.log("SSE connection closed");
+      };
+
+      setTimeout(() => {
+        eventSource.close();
+      }, 30000); // Close SSE after 30 seconds
+
     } catch (error) {
       console.error("Error in chat: ", error);
     }
     setIsLoading(false);
+    chatForm.reset();
   };
 
   return (
@@ -145,7 +169,6 @@ const ConversationPage = () => {
               <Loader />
             </div>
           )}
-          {messages.length === 0 && urlResponse === "" && !isLoading && null}
           <div className="flex flex-col-reverse gap-y-4">
             {messages.map((message, index) => (
               <div
@@ -156,7 +179,7 @@ const ConversationPage = () => {
                     : "bg-muted"
                 }`}
               >
-                {message.role === "user" ? "User" : "Bot"}
+                <p>{message.role === "user" ? "User" : "Bot"}:</p>
                 <p className="text-sm">{message.content}</p>
               </div>
             ))}
