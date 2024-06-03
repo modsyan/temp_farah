@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+langchain-core
+langchain-community
+langchain-openai
+openai
+sse-starlette
+pydantic
+python-dotenv
+replicate
+
+litellm
+chromadb

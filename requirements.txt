@@ -11,3 +11,10 @@ websockets==12.0
 sse-starlette
 replicate
 
+fastapi
+uvicorn
+langchain-community
+openai
+sse-starlette
+pydantic
+litellm

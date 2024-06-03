@@ -26,22 +26,21 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Verify the environment variable
-api_key = os.getenv("OPENAI_API_KEY")
-replicate_api_key = os.getenv("REPLICATE_API_TOKEN")
-
-if api_key and replicate_api_key :
-    logger.info(f"OpenAI API and Replicate Api Key loaded")
+api_key = os.getenv('OPENAI_API_KEY')
+replicate_api_token = os.getenv('REPLICATE_API_TOKEN')
+if api_key and replicate_api_token:
+    logger.info(f"API Keys loaded")
 else:
-    logger.error("OpenAI API key or Replicate Api Key not found")
+    logger.error("API keys not found")
 
-openAIClient = OpenAI(api_key=api_key)
-replicateClient = replicate.Client(api_token=replicate_api_key)
+client = OpenAI(api_key=api_key)
+replicate_client = replicate.Client(api_token=replicate_api_token)
+
+app = FastAPI()
 
 # Global variables for chat history and vector store
 chat_history = [AIMessage(content="Hello, I am a bot. How can I help you?")]
 vector_store = None
-
-app = FastAPI()
 
 class UrlModel(BaseModel):
     url: str
@@ -74,22 +73,16 @@ async def get_vectorstore_from_url(item: UrlModel):
                 vector_store = Chroma.from_documents(document_chunks, OpenAIEmbeddings(openai_api_key=api_key))
                 logger.info("Vector store initialized")
                 return {"message": "Vector store initialized"}
-            # except OpenAI.RateLimitError as e:
-            #     logger.warning(f"Rate limit exceeded. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
-            #     time.sleep(retry_delay)
-            #     retry_delay *= 2  # Exponential backoff
-            # except OpenAI.OpenAIError as e:
-            #     if e.http_status == 429:
-            #         logger.error(f"Quota exceeded: {e}")
-            #         raise HTTPException(status_code=429, detail="Quota exceeded. Please check your OpenAI plan and usage.")
-            #     else:
-            #         raise e
-            except Exception as e:
-                  time.sleep(retry_delay)
-                  retry_delay *= 2  # Exponential backoff
-                  if attempt == max_retries - 1:
-                      raise e
-
+            except OpenAI.RateLimitError as e:
+                logger.warning(f"Rate limit exceeded. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            except OpenAI.OpenAIError as e:
+                if e.http_status == 429:
+                    logger.error(f"Quota exceeded: {e}")
+                    raise HTTPException(status_code=429, detail="Quota exceeded. Please check your OpenAI plan and usage.")
+                else:
+                    raise e
         raise HTTPException(status_code=429, detail="Rate limit exceeded after multiple attempts.")
     except Exception as e:
         logger.error(f"Error in get_vectorstore_from_url: {e}")
@@ -97,6 +90,58 @@ async def get_vectorstore_from_url(item: UrlModel):
 
 class ChatRequest(BaseModel):
     message: str
+
+def call_openai_model(model: str, message: str) -> str:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": message}
+        ]
+    )
+    return response.choices[0].message.content
+
+def call_replicate_model(model: str, message: str) -> str:
+    model_endpoints = {
+        "joehoover/falcon-40b-instruct": "joehoover/falcon-40b-instruct:7d58d6bddc53c23fa451c403b2b5373b1e0fa094e4e0d1b98c3d02931aa07173",
+        "meta/llama-2-70b-chat": "meta/llama-2-70b-chat:02e509c789964a7ea8736978a43525956ef40397be9033abf9fd2badfe68c9e3"
+    }
+
+    try:
+        # check if the model is in the list of available models
+        selected_model = model_endpoints.get(model)
+
+        # if the model is not found, return an empty string
+        if not selected_model:
+            logger.error(f"Model {model} not found")
+            return ""
+
+        # call the Replicate model
+        output = replicateClient.run(
+            model,
+            input={"prompt": prompt}
+        )
+
+        # convert the output to a string
+        result = "".join([event for event in output])
+        return result
+
+    except Exception as e:
+        logger.error(f"Error calling Replicate model: {e}")
+        return ""
+
+def evaluate_response_accuracy(response: str, context: str) -> int:
+    # Simple heuristic to evaluate response accuracy based on context
+    score = 0
+    for word in context.split():
+        if word.lower() in response.lower():
+            score += 1
+    return score
+
+def get_best_response(responses: Dict[str, str], context: str) -> Tuple[str, str]:
+    # Evaluate the accuracy of each response based on the context and select the best one
+    best_model = max(responses, key=lambda model: evaluate_response_accuracy(responses[model], context))
+    return best_model, responses[best_model]
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
@@ -120,14 +165,15 @@ async def chat(request: ChatRequest):
         responses = {}
 
         # Call OpenAI models
-        models_openai = ["gpt-3.5-turbo", "gpt-4"]
-        for model in models_openai:
+        models = ["gpt-3.5-turbo", "gpt-4"]
+        for model in models:
             response = call_openai_model(model, request.message)
             responses[model] = response
             logger.info(f"Response from {model}: {response}")
 
-        models_replicate = ["meta/llama-2-70b-chat","joehoover/falcon-40b"]
-        for model in models_replicate:
+        # Call Replicate models
+        replicate_models = ["joehoover/falcon-40b-instruct", "meta/llama-2-70b-chat"]
+        for model in replicate_models:
             response = call_replicate_model(model, request.message)
             responses[model] = response
             logger.info(f"Response from {model}: {response}")
@@ -168,14 +214,14 @@ async def chat_stream(request: Request):
                 return
 
             responses = {}
-            models_openai = ["gpt-3.5-turbo", "gpt-4"]
-            for model in models_openai:
+            models = ["gpt-3.5-turbo", "gpt-4"]
+            for model in models:
                 response = call_openai_model(model, message)
                 responses[model] = response
                 logger.info(f"Response from {model}: {response}")
 
-            models_replicate = ["meta/llama-2-70b-chat","joehoover/falcon-40b"]
-            for model in models_replicate:
+            replicate_models = ["joehoover/falcon-40b-instruct", "meta/llama-2-70b-chat"]
+            for model in replicate_models:
                 response = call_replicate_model(model, message)
                 responses[model] = response
                 logger.info(f"Response from {model}: {response}")
@@ -192,55 +238,6 @@ async def chat_stream(request: Request):
             yield {"data": json.dumps({"error": str(e)})}
 
     return EventSourceResponse(event_generator())
-
-def call_openai_model(model: str, message: str) -> str:
-    response = openAIClient.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": message}
-        ]
-    )
-    return response.choices[0].message.content
-
-def call_replicate_model(model: str, prompt: str) -> str:
-    try:
-        logger.info(f"Calling Replicate model: {model}")
-        if model == "joehoover/falcon-40b-instruct": 
-            output = replicateClient.run(
-                "joehoover/falcon-40b-instruct:7d58d6bddc53c23fa451c403b2b5373b1e0fa094e4e0d1b98c3d02931aa07173",
-                input={"prompt": prompt}
-            )
-            result = "".join([event for event in output])
-            return result
-
-        elif model == "meta/llama-2-70b-chat":
-            output = replicateClient.run(
-                "meta/llama-2-70b-chat:02e509c789964a7ea8736978a43525956ef40397be9033abf9fd2badfe68c9e3",
-                input={"prompt": prompt}
-            )
-            result = "".join([event for event in output])
-            return result
-        logger.error(f"Model {model} not found")
-        return "Error !!!!"
-    except Exception as e:
-        logger.error(f"Error calling Replicate model: {e}")
-        return ""
-
-
-def evaluate_response_accuracy(response: str, context: str) -> int:
-    # Simple heuristic to evaluate response accuracy based on context
-    score = 0
-    for word in context.split():
-        if word.lower() in response.lower():
-            score += 1
-    return score
-
-def get_best_response(responses: Dict[str, str], context: str) -> Tuple[str, str]:
-    # Evaluate the accuracy of each response based on the context and select the best one
-    best_model = max(responses, key=lambda model: evaluate_response_accuracy(responses[model], context))
-    return best_model, responses[best_model]
-
 
 def get_context_retriever_chain(vector_store):
     logger.info("Creating context retriever chain")
@@ -284,5 +281,4 @@ def get_conversational_rag_chain(retriever_chain):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    uvicorn.run(app, host="0.0.0.0", port=8888)

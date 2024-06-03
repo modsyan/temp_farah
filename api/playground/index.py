@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_community.document_loaders import WebBaseLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -16,7 +16,6 @@ import time
 from openai import OpenAI
 from sse_starlette.sse import EventSourceResponse
 import json
-import replicate
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,22 +25,19 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Verify the environment variable
-api_key = os.getenv("OPENAI_API_KEY")
-replicate_api_key = os.getenv("REPLICATE_API_TOKEN")
-
-if api_key and replicate_api_key :
-    logger.info(f"OpenAI API and Replicate Api Key loaded")
+api_key = os.getenv('OPENAI_API_KEY')
+if api_key:
+    logger.info(f"OpenAI API Key loaded")
 else:
-    logger.error("OpenAI API key or Replicate Api Key not found")
+    logger.error("OpenAI API key not found")
 
-openAIClient = OpenAI(api_key=api_key)
-replicateClient = replicate.Client(api_token=replicate_api_key)
+client = OpenAI(api_key=api_key)
+
+app = FastAPI()
 
 # Global variables for chat history and vector store
 chat_history = [AIMessage(content="Hello, I am a bot. How can I help you?")]
 vector_store = None
-
-app = FastAPI()
 
 class UrlModel(BaseModel):
     url: str
@@ -74,22 +70,16 @@ async def get_vectorstore_from_url(item: UrlModel):
                 vector_store = Chroma.from_documents(document_chunks, OpenAIEmbeddings(openai_api_key=api_key))
                 logger.info("Vector store initialized")
                 return {"message": "Vector store initialized"}
-            # except OpenAI.RateLimitError as e:
-            #     logger.warning(f"Rate limit exceeded. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
-            #     time.sleep(retry_delay)
-            #     retry_delay *= 2  # Exponential backoff
-            # except OpenAI.OpenAIError as e:
-            #     if e.http_status == 429:
-            #         logger.error(f"Quota exceeded: {e}")
-            #         raise HTTPException(status_code=429, detail="Quota exceeded. Please check your OpenAI plan and usage.")
-            #     else:
-            #         raise e
-            except Exception as e:
-                  time.sleep(retry_delay)
-                  retry_delay *= 2  # Exponential backoff
-                  if attempt == max_retries - 1:
-                      raise e
-
+            except OpenAI.RateLimitError as e:
+                logger.warning(f"Rate limit exceeded. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            except OpenAI.OpenAIError as e:
+                if e.http_status == 429:
+                    logger.error(f"Quota exceeded: {e}")
+                    raise HTTPException(status_code=429, detail="Quota exceeded. Please check your OpenAI plan and usage.")
+                else:
+                    raise e
         raise HTTPException(status_code=429, detail="Rate limit exceeded after multiple attempts.")
     except Exception as e:
         logger.error(f"Error in get_vectorstore_from_url: {e}")
@@ -97,6 +87,29 @@ async def get_vectorstore_from_url(item: UrlModel):
 
 class ChatRequest(BaseModel):
     message: str
+
+def call_openai_model(model: str, message: str) -> str:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": message}
+        ]
+    )
+    return response.choices[0].message.content
+
+def evaluate_response_accuracy(response: str, context: str) -> int:
+    # Simple heuristic to evaluate response accuracy based on context
+    score = 0
+    for word in context.split():
+        if word.lower() in response.lower():
+            score += 1
+    return score
+
+def get_best_response(responses: Dict[str, str], context: str) -> str:
+    # Evaluate the accuracy of each response based on the context and select the best one
+    best_model = max(responses, key=lambda model: evaluate_response_accuracy(responses[model], context))
+    return responses[best_model]
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
@@ -118,28 +131,20 @@ async def chat(request: ChatRequest):
         logger.info(f"Chat history: {chat_history}")
 
         responses = {}
-
-        # Call OpenAI models
-        models_openai = ["gpt-3.5-turbo", "gpt-4"]
-        for model in models_openai:
+        models = ["gpt-3.5-turbo", "gpt-4"]
+        for model in models:
             response = call_openai_model(model, request.message)
             responses[model] = response
             logger.info(f"Response from {model}: {response}")
 
-        models_replicate = ["meta/llama-2-70b-chat","joehoover/falcon-40b"]
-        for model in models_replicate:
-            response = call_replicate_model(model, request.message)
-            responses[model] = response
-            logger.info(f"Response from {model}: {response}")
-
-        best_model, best_response = get_best_response(responses, context_text)
-        logger.info(f"Best response from {best_model}: {best_response}")
+        best_response = get_best_response(responses, context_text)
+        logger.info(f"Best response: {best_response}")
 
         chat_history.append(user_message)
         ai_message = AIMessage(content=best_response)
         chat_history.append(ai_message)
 
-        return {"answer": best_response, "model": best_model}
+        return {"answer": best_response}
     except Exception as e:
         logger.error(f"Error in chat endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -168,79 +173,24 @@ async def chat_stream(request: Request):
                 return
 
             responses = {}
-            models_openai = ["gpt-3.5-turbo", "gpt-4"]
-            for model in models_openai:
+            models = ["gpt-3.5-turbo", "gpt-4"]
+            for model in models:
                 response = call_openai_model(model, message)
                 responses[model] = response
                 logger.info(f"Response from {model}: {response}")
 
-            models_replicate = ["meta/llama-2-70b-chat","joehoover/falcon-40b"]
-            for model in models_replicate:
-                response = call_replicate_model(model, message)
-                responses[model] = response
-                logger.info(f"Response from {model}: {response}")
-
-            best_model, best_response = get_best_response(responses, context_text)
-            logger.info(f"Best response from {best_model}: {best_response}")
+            best_response = get_best_response(responses, context_text)
+            logger.info(f"Best response: {best_response}")
 
             chat_history.append(user_message)
             ai_message = AIMessage(content=best_response)
             chat_history.append(ai_message)
-            yield {"data": json.dumps({"role": "bot", "content": best_response, "model": best_model})}
+            yield {"data": json.dumps({"role": "bot", "content": best_response})}
         except Exception as e:
             logger.error(f"Error in chat_stream: {e}", exc_info=True)
             yield {"data": json.dumps({"error": str(e)})}
 
     return EventSourceResponse(event_generator())
-
-def call_openai_model(model: str, message: str) -> str:
-    response = openAIClient.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": message}
-        ]
-    )
-    return response.choices[0].message.content
-
-def call_replicate_model(model: str, prompt: str) -> str:
-    try:
-        logger.info(f"Calling Replicate model: {model}")
-        if model == "joehoover/falcon-40b-instruct": 
-            output = replicateClient.run(
-                "joehoover/falcon-40b-instruct:7d58d6bddc53c23fa451c403b2b5373b1e0fa094e4e0d1b98c3d02931aa07173",
-                input={"prompt": prompt}
-            )
-            result = "".join([event for event in output])
-            return result
-
-        elif model == "meta/llama-2-70b-chat":
-            output = replicateClient.run(
-                "meta/llama-2-70b-chat:02e509c789964a7ea8736978a43525956ef40397be9033abf9fd2badfe68c9e3",
-                input={"prompt": prompt}
-            )
-            result = "".join([event for event in output])
-            return result
-        logger.error(f"Model {model} not found")
-        return "Error !!!!"
-    except Exception as e:
-        logger.error(f"Error calling Replicate model: {e}")
-        return ""
-
-
-def evaluate_response_accuracy(response: str, context: str) -> int:
-    # Simple heuristic to evaluate response accuracy based on context
-    score = 0
-    for word in context.split():
-        if word.lower() in response.lower():
-            score += 1
-    return score
-
-def get_best_response(responses: Dict[str, str], context: str) -> Tuple[str, str]:
-    # Evaluate the accuracy of each response based on the context and select the best one
-    best_model = max(responses, key=lambda model: evaluate_response_accuracy(responses[model], context))
-    return best_model, responses[best_model]
-
 
 def get_context_retriever_chain(vector_store):
     logger.info("Creating context retriever chain")
@@ -285,4 +235,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
